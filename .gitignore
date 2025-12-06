@@ -1,0 +1,19 @@
+# Ignore all .env files in any directory
+*.env
+
+# Ignore Python cache and virtual environments
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Ignore IDE configuration files
+.idea/
+.vscode/
+
+# Ignore log files
+*.log
+
+# Ignore model and other large files
+STT_TTS/models/
