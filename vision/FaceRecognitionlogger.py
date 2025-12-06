@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+import os, json, time, signal, argparse, traceback
+from datetime import datetime, timedelta
+from pathlib import Path
+import numpy as np
+from numpy.linalg import norm
+from picamera2 import Picamera2
+import cv2
+from insightface.app import FaceAnalysis
+
+
+class FaceRecognitionLogger:
+    # ---------- CONFIG ----------
+    def __init__(
+        self,
+        db_dir: Path = Path("face_db"),
+        log_dir: Path = Path("./recognition_logs"),
+        keep_days: int = 3,
+    ):
+        # Initialize directories and variables
+        self.DB_DIR = Path(db_dir)
+        self.EMB_FILE = self.DB_DIR / "embeddings.npz"
+        self.META_FILE = self.DB_DIR / "meta.json"
+        self.LOG_DIR = Path(log_dir)
+        self.KEEP_DAYS = keep_days
+        self.stop_flag = False
+
+        # InsightFace app will be created lazily in detect()
+        self.app = None
+
+        # Ensure the database and log directories exist
+        self.ensure_db()
+        self.ensure_log_dir()
+
+        # Load embeddings from the database
+        self.E, self.N, self.M = self.load_embeddings()
+
+        # Precompute norms once (for faster cosine similarity)
+        self.E_norms = self._compute_E_norms(self.E)
+
+    # ---------- DB HELPERS ----------
+    def ensure_db(self):
+        self.DB_DIR.mkdir(parents=True, exist_ok=True)
+        if not self.EMB_FILE.exists():
+            np.savez_compressed(
+                self.EMB_FILE,
+                embeddings=np.empty((0, 512), np.float32),
+                names=np.array([], dtype=object),
+            )
+        if not self.META_FILE.exists():
+            self.META_FILE.write_text("{}", encoding="utf-8")
+
+    def load_embeddings(self):
+        """Return (E [Nx512], N [N dtype=object], M {name:{role,signature}}). Never crashes."""
+        try:
+            d = np.load(self.EMB_FILE, allow_pickle=True)
+            E = np.array(d["embeddings"], dtype=np.float32)
+            N = d["names"]
+            try:
+                meta = json.loads(self.META_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                meta = {}
+            if E.ndim == 1:
+                E = E.reshape(1, -1)
+            if E.size == 0:
+                E = np.empty((0, 512), np.float32)
+                N = np.array([], dtype=object)
+            return E, N, meta
+        except Exception as e:
+            print(f"[WARN] Failed to load embeddings DB: {e}")
+            return np.empty((0, 512), np.float32), np.array([], dtype=object), {}
+
+    def _compute_E_norms(self, E: np.ndarray) -> np.ndarray:
+        """
+        Precompute ||E_i|| for cosine similarity.
+        Called once in __init__, avoids recomputing every frame.
+        """
+        if E.size == 0:
+            return np.empty((0,), dtype=np.float32)
+        return np.linalg.norm(E, axis=1).astype(np.float32) + 1e-9
+
+    # ---------- LOG HELPERS ----------
+    def ensure_log_dir(self):
+        self.LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    def today_log_path(self):
+        self.ensure_log_dir()
+        fname = datetime.now().strftime("%Y-%m-%d.jsonl")
+        return self.LOG_DIR / fname
+
+    def prune_old_logs(self, keep_days=None):
+        if keep_days is None:
+            keep_days = self.KEEP_DAYS
+        cutoff = datetime.now().date() - timedelta(days=keep_days)
+        for p in self.LOG_DIR.glob("*.jsonl"):
+            try:
+                d = datetime.strptime(p.stem, "%Y-%m-%d").date()
+                if d < cutoff:
+                    p.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def append_log(self, obj):
+        p = self.today_log_path()
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+    # ---------- UTILS ----------
+    def clean_ascii(self, s):
+        if s is None:
+            return ""
+        if not isinstance(s, str):
+            s = str(s)
+        return s.encode("ascii", "ignore").decode().replace("?", "").strip()
+
+    def label_for(self, name, role, score, sig):
+        name = self.clean_ascii(name)
+        role = self.clean_ascii(role)
+        sig = self.clean_ascii(sig)
+        role_txt = f" ({role})" if role else ""
+        sig_txt = f" Sig:{sig}" if sig else ""
+        return f"Verified: {name}{role_txt} {score:.2f}{sig_txt}".strip()
+
+    # ---------- RECOGNITION CORE ----------
+    def recognize_frame(self, app, frame, E, N, M, sim_thresh, E_norms=None):
+        """
+        Run InsightFace on one frame and compute counts.
+
+        E_norms: precomputed row norms of E for faster cosine similarity.
+        """
+        faces_out = []
+        counts = {"student": 0, "staff": 0, "unknown": 0, "total": 0}
+
+        # If no embeddings, still run detection but skip identity matching
+        faces = app.get(frame)
+        if not faces:
+            # nothing to recognize, but counts['total'] stays 0
+            return faces_out, counts
+
+        h, w = frame.shape[:2]
+
+        if E_norms is None:
+            # Fallback if not passed (should not happen in normal use)
+            if E.size:
+                E_norms = np.linalg.norm(E, axis=1).astype(np.float32) + 1e-9
+            else:
+                E_norms = np.empty((0,), dtype=np.float32)
+
+        for f in faces:
+            x1, y1, x2, y2 = map(int, f.bbox)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w - 1, x2), min(h - 1, y2)
+            name = "UNKNOWN"
+            role = ""
+            score = None
+
+            fe = getattr(f, "normed_embedding", None)
+            if E.size and fe is not None and fe.size == 512:
+                emb = fe.astype(np.float32)
+                emb = emb / (norm(emb) + 1e-9)
+
+                # cosine similarity using precomputed norms
+                sims = (E @ emb) / E_norms
+                idx = int(np.argmax(sims))
+                sc = float(sims[idx])
+                if sc >= sim_thresh:
+                    nm = N[idx]
+                    name = self.clean_ascii(nm)
+                    meta_entry = M.get(str(nm), {})
+                    role = meta_entry.get("role", "")
+                    score = sc
+
+            if name == "UNKNOWN":
+                counts["unknown"] += 1
+            elif role == "student":
+                counts["student"] += 1
+            elif role == "staff":
+                counts["staff"] += 1
+            else:
+                counts["unknown"] += 1
+
+            faces_out.append(
+                {
+                    "name": name,
+                    "role": role,
+                    "score": score,
+                    "bbox": [x1, y1, x2, y2],
+                }
+            )
+
+        counts["total"] = len(faces_out)
+        return faces_out, counts
+
+    # ---------- MAIN LOOP ----------
+    def detect(self):
+        parser = argparse.ArgumentParser(
+            description="Headless face recognition logger (Pi, no streaming)"
+        )
+        parser.add_argument(
+            "--fmt",
+            choices=["yuv", "rgb", "bgr"],
+            default="yuv",
+            help="camera output pixel format",
+        )
+        parser.add_argument("--width", type=int, default=640)
+        parser.add_argument("--height", type=int, default=480)
+        parser.add_argument(
+            "--det-interval", type=int, default=6, help="detect every N frames"
+        )
+        parser.add_argument(
+            "--det-width",
+            type=int,
+            default=320,
+            help="InsightFace det_size (square, e.g. 320)",
+        )
+        parser.add_argument(
+            "--thresh",
+            type=float,
+            default=0.35,
+            help="cosine similarity threshold",
+        )
+        parser.add_argument(
+            "--keep-days",
+            type=int,
+            default=self.KEEP_DAYS,
+            help="days to keep daily .jsonl logs",
+        )
+        args = parser.parse_args()
+
+        # ---------- InsightFace init ----------
+        print(
+            f"[INFO] Initialising InsightFace (buffalo_l, det_size={args.det_width}x{args.det_width})..."
+        )
+        try:
+            self.app = FaceAnalysis(
+                name="buffalo_l",
+                providers=["CPUExecutionProvider"],
+                allowed_modules=["detection", "recognition"],
+            )
+            self.app.prepare(
+                ctx_id=0,
+                det_size=(args.det_width, args.det_width),
+            )
+        except Exception as e:
+            print(f"[ERROR] Failed to initialise InsightFace app: {e}")
+            traceback.print_exc()
+            return
+
+        print(
+            f"[INFO] Loaded {len(self.N)} identities from embeddings DB (embeddings.npz)."
+        )
+
+        # ---------- Camera setup (PiCamera2) ----------
+        try:
+            cam = Picamera2()
+        except Exception as e:
+            print(f"[ERROR] Failed to create Picamera2 instance: {e}")
+            traceback.print_exc()
+            return
+
+        fmt = args.fmt.lower()
+        if fmt == "yuv":
+            main_cfg = {"size": (args.width, args.height), "format": "YUV420"}
+            convert_mode = "yuv2bgr"
+        elif fmt == "rgb":
+            main_cfg = {"size": (args.width, args.height), "format": "RGB888"}
+            convert_mode = "rgb2bgr"
+        else:
+            main_cfg = {"size": (args.width, args.height), "format": "BGR888"}
+            convert_mode = "bgr"
+
+        try:
+            cfg = cam.create_video_configuration(main=main_cfg, buffer_count=4)
+            cam.configure(cfg)
+            cam.start()
+        except Exception as e:
+            print(f"[ERROR] Failed to configure/start Picamera2: {e}")
+            traceback.print_exc()
+            return
+
+        time.sleep(1.0)  # AE/AWB settle
+
+        # ---------- State for change-logging ----------
+        prev_names = set()  # recognized names currently in frame
+        prev_counts = {"student": 0, "staff": 0, "unknown": 0, "total": 0}
+        frame_idx = 0
+
+        print(f"[INFO] Logging to: {self.today_log_path()}")
+        self.append_log(
+            {"timestamp": datetime.now().isoformat(), "event": "logger_started"}
+        )
+
+        # Optional: install SIGINT handler so Ctrl+C sets stop_flag
+        def _handle_sigint(signum, frame):
+            print("\n[INFO] SIGINT received, stopping logger loop...")
+            self.stop_flag = True
+
+        try:
+            signal.signal(signal.SIGINT, _handle_sigint)
+        except Exception:
+            # might fail if used inside a thread; ignore
+            pass
+
+        try:
+            while not self.stop_flag:
+                try:
+                    # Capture frame
+                    if convert_mode == "yuv2bgr":
+                        yuv = cam.capture_array("main")
+                        frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+                    elif convert_mode == "rgb2bgr":
+                        rgb = cam.capture_array("main")
+                        frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                    else:
+                        frame = cam.capture_array("main")
+
+                    if frame is None:
+                        # rare but safer
+                        continue
+
+                    # Detect every N frames
+                    if frame_idx % max(1, args.det_interval) == 0:
+                        faces_out, counts = self.recognize_frame(
+                            self.app,
+                            frame,
+                            self.E,
+                            self.N,
+                            self.M,
+                            args.thresh,
+                            self.E_norms,
+                        )
+
+                        # Logging of entered/left names
+                        curr_names = set(
+                            [f["name"] for f in faces_out if f["name"] != "UNKNOWN"]
+                        )
+                        entered = sorted(list(curr_names - prev_names))
+                        left = sorted(list(prev_names - curr_names))
+
+                        now_iso = datetime.now().isoformat()
+
+                        for nm in entered:
+                            self.append_log(
+                                {
+                                    "timestamp": now_iso,
+                                    "event": "enter",
+                                    "name": nm,
+                                }
+                            )
+
+                        for nm in left:
+                            self.append_log(
+                                {
+                                    "timestamp": now_iso,
+                                    "event": "leave",
+                                    "name": nm,
+                                }
+                            )
+
+                        if counts != prev_counts:
+                            self.append_log(
+                                {
+                                    "timestamp": now_iso,
+                                    "event": "counts_change",
+                                    "counts": counts,
+                                    "recognized": sorted(list(curr_names)),
+                                }
+                            )
+
+                        prev_names = curr_names
+                        prev_counts = counts
+
+                    frame_idx += 1
+                    # short sleep to ease CPU slightly; detection is already the bottleneck
+                    time.sleep(0.005)
+
+                except Exception as loop_e:
+                    # keep the loop alive but log the error once per failure
+                    print("[ERROR] Exception inside capture/recognize loop:")
+                    traceback.print_exc()
+                    self.append_log(
+                        {
+                            "timestamp": datetime.now().isoformat(),
+                            "event": "error",
+                            "message": str(loop_e),
+                            "frame_idx": frame_idx,
+                        }
+                    )
+                    # tiny backoff
+                    time.sleep(0.05)
+
+        finally:
+            try:
+                cam.stop()
+            except Exception:
+                pass
+            self.append_log(
+                {"timestamp": datetime.now().isoformat(), "event": "logger_stopped"}
+            )
+            self.prune_old_logs(args.keep_days)
+            print("[INFO] Logger stopped and old logs pruned.")
+
+
+# Main entry point
+if __name__ == "__main__":
+    logger = FaceRecognitionLogger()
+    logger.detect()

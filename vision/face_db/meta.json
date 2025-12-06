@@ -1,0 +1,30 @@
+{
+  "Alex": {
+    "role": "student",
+    "signature": "CF42-FA27"
+  },
+  "Prof. Herrler": {
+    "role": "staff",
+    "signature": "639B-6878"
+  },
+  "Bhuvan": {
+    "role": "student",
+    "signature": "C16D-B8EE"
+  },
+  "Varun": {
+    "role": "student",
+    "signature": "D847-AC34"
+  },
+  "Gaurav": {
+    "role": "student",
+    "signature": "8A06-C20F"
+  },
+  "Fabian": {
+    "role": "staff",
+    "signature": "534E-FEE4"
+  },
+  "Maureen": {
+    "role": "student",
+    "signature": "30A0-5493"
+  }
+}
