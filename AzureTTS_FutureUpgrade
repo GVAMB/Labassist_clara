@@ -1,0 +1,64 @@
+import os
+import azure.cognitiveservices.speech as speechsdk
+import time
+
+# Set your Azure Speech API key and region
+AZURE_SPEECH_KEY = "YOUR_AZURE_SPEECH_API_KEY"
+AZURE_REGION = "YOUR_AZURE_REGION"
+
+def azure_tts(text: str, voice_name="en-US-JennyNeural", save_to_file=False, file_name="output.wav"):
+    """
+    This function uses Azure's Text-to-Speech API to synthesize speech from text.
+
+    Parameters:
+    text (str): The input text to be converted to speech.
+    voice_name (str): The name of the voice to use (default is "en-US-JennyNeural").
+    save_to_file (bool): If True, the speech will be saved to a file.
+    file_name (str): The name of the file to save the speech to (default is "output.wav").
+
+    Returns:
+    None: It will either play the speech or save it to a file.
+    """
+    
+    try:
+        # Create a speech configuration with your Azure API key and region
+        speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_REGION)
+        
+        # Set the desired voice for speech synthesis
+        speech_config.speech_synthesis_voice_name = voice_name
+        
+        # Set audio output configuration (either to play or save to file)
+        if save_to_file:
+            audio_config = speechsdk.audio.AudioOutputConfig(filename=file_name)
+        else:
+            audio_config = speechsdk.audio.AudioOutputConfig(use_default_speaker=True)
+        
+        # Create a synthesizer with the given configuration
+        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
+
+        # Synthesize the text to speech
+        result = synthesizer.speak_text_async(text).get()
+
+        # Check result status
+        if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+            print(f"Successfully synthesized the text to speech: {text}")
+            if save_to_file:
+                print(f"Speech saved to {file_name}")
+        else:
+            print(f"Speech synthesis failed: {result.error_details}")
+            if result.reason == speechsdk.ResultReason.Canceled:
+                cancellation_details = result.cancellation_details
+                print(f"Error details: {cancellation_details.error_details}")
+
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+
+# Example usage
+if __name__ == "__main__":
+    text_input = "Hello, this is a test of Azure TTS!"
+    
+    # Test playback
+    azure_tts(text_input)
+
+    # Test saving to a file
+    azure_tts(text_input, save_to_file=True, file_name="test_output.wav")
