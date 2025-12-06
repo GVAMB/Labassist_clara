@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+import time
+import json
+import os
+from pathlib import Path
+
+import numpy as np
+from numpy.linalg import norm
+import cv2
+from picamera2 import Picamera2
+from insightface.app import FaceAnalysis
+
+# =========================
+# DB PATHS (same as before)
+# =========================
+
+DB_DIR = Path("face_db")
+EMB_FILE = DB_DIR / "embeddings.npz"
+META_FILE = DB_DIR / "meta.json"
+
+DB_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def ensure_db():
+    """Make sure embeddings + meta files exist."""
+    if not EMB_FILE.exists():
+        np.savez_compressed(
+            EMB_FILE,
+            embeddings=np.empty((0, 512), dtype=np.float32),
+            names=np.array([], dtype=object),
+        )
+    if not META_FILE.exists():
+        with open(META_FILE, "w", encoding="utf-8") as f:
+            json.dump({}, f, indent=2, ensure_ascii=False)
+
+
+def load_db():
+    """Load embeddings, names, and meta dict."""
+    ensure_db()
+    d = np.load(EMB_FILE, allow_pickle=True)
+    with open(META_FILE, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    E = d["embeddings"]
+    N = d["names"]
+    return E, N, meta
+
+
+def save_db(E, N, M):
+    """Save embeddings + names + meta."""
+    np.savez_compressed(EMB_FILE, embeddings=E.astype(np.float32), names=N)
+    with open(META_FILE, "w", encoding="utf-8") as f:
+        json.dump(M, f, indent=2, ensure_ascii=False)
+
+
+def append_person_embedding(name: str, role_input: str, emb: np.ndarray):
+    """
+    Add / overwrite one person in the DB.
+    role_input: whatever user typed (student/professor), mapped to student/staff.
+    """
+    E, N, M = load_db()
+
+    emb = emb.astype(np.float32)
+    emb = emb / (norm(emb) + 1e-9)
+
+    # map role
+    role_input = (role_input or "").strip().lower()
+    role_db = "staff" if role_input.startswith("prof") else "student"
+
+    # overwrite if already exists
+    if N.size and name in list(N):
+        idx = list(N).index(name)
+        E[idx] = emb
+        print(f"[DB] Overwriting embedding for {name} ({role_db}).")
+    else:
+        E = np.vstack([E, emb]) if E.size else emb[None, :]
+        N = np.append(N, name)
+        print(f"[DB] Adding new person {name} ({role_db}).")
+
+    # random signature (just for display)
+    sig = f"{np.random.randint(0,0xFFFF):04X}-{np.random.randint(0,0xFFFF):04X}"
+    M[name] = {"role": role_db, "signature": sig}
+    save_db(E, N, M)
+    print(f"[DB] Stored {name} ({role_db}) Sig:{sig}")
+
+
+# =========================
+# CAMERA + FACE MODEL
+# =========================
+
+def init_camera(width=640, height=480):
+    cam = Picamera2()
+    cfg = cam.create_video_configuration(
+        main={"size": (width, height), "format": "YUV420"}
+    )
+    cam.configure(cfg)
+    cam.start()
+    time.sleep(1.0)  # let AE/AWB settle
+    print("[CAM] Picamera2 started.")
+    return cam
+
+
+def get_frame_bgr(cam: Picamera2):
+    """Capture one frame as BGR (correct colors)."""
+    yuv = cam.capture_array("main")  # YUV420
+    frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+    return frame
+
+
+def init_insightface():
+    print("[INFO] Loading InsightFace (CPU only)...")
+    app = FaceAnalysis(providers=["CPUExecutionProvider"])
+    app.prepare(ctx_id=0, det_size=(320, 320))
+    print("[INFO] InsightFace ready.")
+    return app
+
+
+def cosine_best_match(emb_query, E, N, meta, thresh=0.45):
+    """
+    Find best match in DB.
+    Returns (label, name, role, best_sim).
+    If no match or below thresh -> ("Unknown", None, None, best_sim).
+    """
+    if E.size == 0 or N.size == 0:
+        return "Unknown", None, None, 0.0
+
+    emb_query = emb_query.astype(np.float32)
+    emb_query = emb_query / (norm(emb_query) + 1e-9)
+
+    sims = E @ emb_query
+    best_idx = int(np.argmax(sims))
+    best_sim = float(sims[best_idx])
+
+    if best_sim < thresh:
+        return "Unknown", None, None, best_sim
+
+    name = str(N[best_idx])
+    role = meta.get(name, {}).get("role", "")
+    if role:
+        label = f"{name} ({role})"
+    else:
+        label = name
+    return label, name, role, best_sim
+
+
+# =========================
+# ENROLL UNKNOWN PERSON
+# =========================
+
+def enroll_unknown_from_camera(app: FaceAnalysis, cam: Picamera2,
+                               shots: int = 20, timeout_sec: int = 30):
+    """
+    Capture multiple embeddings from whoever is in front of the camera now.
+    No GUI, just text progress.
+    Returns mean embedding or None if failed.
+    """
+    print(f"\n[ENROLL] Starting capture for unknown person.")
+    print(f"[ENROLL] Please ask them to stand in front of the camera.")
+    print(f"[ENROLL] Collecting {shots} samples (timeout {timeout_sec}s)...")
+
+    samples = []
+    start = time.time()
+
+    while len(samples) < shots and (time.time() - start) < timeout_sec:
+        frame = get_frame_bgr(cam)
+        faces = app.get(frame)
+        if not faces:
+            continue
+
+        # choose largest face
+        f = max(
+            faces,
+            key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]),
+        )
+        emb = getattr(f, "normed_embedding", None)
+        if emb is None or emb.size == 0:
+            continue
+
+        samples.append(emb.astype(np.float32))
+        print(f"[ENROLL] Collected {len(samples)}/{shots}", end="\r", flush=True)
+
+    print()  # newline
+
+    if len(samples) < 5:
+        print("[ENROLL] ❌ Not enough good samples. Aborting.")
+        return None
+
+    emb_mean = np.mean(np.vstack(samples), axis=0)
+    emb_mean = emb_mean / (norm(emb_mean) + 1e-9)
+    print(f"[ENROLL] ✅ Collected {len(samples)} samples.")
+    return emb_mean
+
+
+# =========================
+# MAIN LOOP: DYNAMIC ENROLL
+# =========================
+
+def main():
+    ensure_db()
+    E, N, M = load_db()
+    print(f"[DB] Loaded {len(N)} known identities.")
+
+    app = init_insightface()
+    cam = init_camera(width=640, height=480)
+
+    SIM_THRESH = 0.45
+    PROMPT_COOLDOWN = 10.0  # seconds between prompts for unknowns
+    last_prompt_time = 0.0
+
+    print("\n[RUN] Dynamic recognition + enrollment running.")
+    print("[RUN] Ctrl+C to stop.\n")
+
+    try:
+        while True:
+            frame = get_frame_bgr(cam)
+            faces = app.get(frame)
+
+            labels_this_frame = []
+            has_unknown = False
+
+            for f in faces:
+                emb = getattr(f, "normed_embedding", None)
+                if emb is None or emb.size == 0:
+                    continue
+
+                label, name, role, sim = cosine_best_match(emb, E, N, M, SIM_THRESH)
+                labels_this_frame.append((label, sim))
+
+                if label == "Unknown":
+                    has_unknown = True
+
+            # For debug, you can uncomment:
+            # if labels_this_frame:
+            #     print("[DEBUG] Detected:", labels_this_frame)
+
+            now = time.time()
+
+            if has_unknown and (now - last_prompt_time) > PROMPT_COOLDOWN:
+                last_prompt_time = now
+                print("\n[INFO] Unknown person detected in front of the camera.")
+                ans = input("Enroll this person into the database? (y/n): ").strip().lower()
+                if ans in ("y", "yes"):
+                    emb_mean = enroll_unknown_from_camera(app, cam)
+                    if emb_mean is not None:
+                        # Ask for metadata
+                        name = input("Enter name (e.g. Alex): ").strip()
+                        role = input("Enter role (student/professor): ").strip()
+                        if not name:
+                            print("[ENROLL] ❌ Empty name, aborting enrollment.")
+                        else:
+                            append_person_embedding(name, role, emb_mean)
+                            # reload DB so next loop sees them as known
+                            E, N, M = load_db()
+                            print("[ENROLL] ✅ Person added. Resuming recognition.")
+                    else:
+                        print("[ENROLL] Enrollment aborted (no embedding).")
+
+            # tiny sleep so we don't absolutely hammer the CPU
+            time.sleep(0.05)
+
+    except KeyboardInterrupt:
+        print("\n[RUN] Interrupted by user. Shutting down...")
+    finally:
+        cam.stop()
+        print("[CAM] Camera stopped.")
+        print("[DONE] Bye.")
+
+
+if __name__ == "__main__":
+    main()
